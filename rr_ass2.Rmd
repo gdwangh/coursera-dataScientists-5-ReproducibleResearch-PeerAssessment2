@@ -1,0 +1,283 @@
+---
+title: Severe weather event types most harmful to public health and economic
+output: html_document
+---
+
+
+## Synopsis
+  The basic goal of this anaylse is to explore the NOAA Storm Database and answer which type of severe weather events can cause public health and economic problems for communities and municipalities most.
+  To minimize the data size, records without person being harmed and without economic costs are filtered out. And records before 1993 is filtered too because of the events before 1993 is too few. To valid evtype, some evtype string are trans by regex and gsub.
+  The population harmed(FATALITIES+INJURIES) and economic cost (PROPDMG+CROPDMG) in cleaned data are sum by event type and sorted to get the top3 event type. And at last, top3 event's influence to states are given.
+  
+## Data Processing
+### load the data
+Download data from the U.S. National Oceanic and Atmospheric Administration's (NOAA) storm website
+
+```{r}
+library(data.table)
+library(reshape2)
+library(lattice)
+library(latticeExtra)
+library(maps)
+library(mapproj)
+library(choroplethr)
+
+setwd("D:/workspace/dataScientists/5-Reproducible Research")
+```
+
+```{r DownloadChunk,cache=TRUE,results='hide'}
+Sys.setlocale('LC_ALL', 'English')
+
+# download and unzip the data file
+if (!file.exists("StormData.csv.bz2")) {
+  fileURL<-"http://d396qusza40orc.cloudfront.net/repdata%2Fdata%2FStormData.csv.bz2"
+  download.file(fileURL,destfile="StormData.csv.bz2")
+  list.files("./StormData.csv.bz2")
+}
+```
+To minimize the data in memroy, only load the columns to be used
+```{r loadDataChunk,cache=TRUE,results='hide'}
+rawdata<-as.data.table(read.csv("StormData.csv.bz2",header=TRUE, nrows=5))
+to_read = c("NULL", NA,rep("NULL",4),NA,NA,rep("NULL",14),rep(NA,6),rep("NULL",8),NA)
+sdata<-as.data.table(read.csv("StormData.csv.bz2",colClasses=to_read,stringsAsFactors=FALSE))
+sdata[, year:=year(as.Date(strptime(BGN_DATE, "%m/%d/%Y %H:%M:%S")))]
+sdata$STATE = as.factor(sdata$STATE)
+```
+```{r}
+dim(sdata)
+summary(sdata)
+```
+
+### clean Event type
+get rid of records with human+economic costs are zero, which no affect to the goal
+```{r}
+cost_data<-subset(sdata,FATALITIES+INJURIES+PROPDMG+CROPDMG>0)
+dim(cost_data)
+```
+
+In  Storm Data Documentation, the number of valid event types is 48, while the number of EVTYPE in data is larger than that
+```{r}
+length(unique(cost_data$EVTYPE))
+```
+
+In Storm Data Documentation, there are such valid event types as "Cold/Wind Chill" and "Extreme Cold/Wind Chill". So, greping and gsub should be done from longer to shorter.Sort the valid event type name descreasing.
+```{r,results='hide'}
+event_type<-data.table(typename=c("Avalanche",
+  "Blizzard",
+  "Coastal Flood",
+  "Cold/Wind Chill",
+  "Debris Flow",
+  "Dense Fog",
+  "Dense Smoke",
+  "Drought",
+  "Dust Devil",
+  "Dust Storm",
+  "Excessive Heat",
+  "Extreme Cold/Wind Chill",
+  "Flash Flood",
+  "Flood",
+  "Frost/Freeze",
+  "Funnel Cloud",
+  "Freezing Fog",
+  "Hail",
+  "Heat",
+  "Heavy Rain",
+  "Heavy Snow",
+  "High Surf",
+  "High Wind",
+  "Hurricane",
+  "Ice Storm",
+  "Lake-Effect Snow",
+  "Lakeshore Flood",
+  "Lightning",
+  "Marine Hail",
+  "Marine High Wind",
+  "Marine Strong Wind",
+  "Marine Thunderstorm Wind",
+  "Rip Current",
+  "Seiche",
+  "Sleet",
+  "Storm Surge/Tide",
+  "Strong Wind",
+  "Thunderstorm Wind",
+  "Tornado",
+  "Tropical Depression",
+  "Tropical Storm",
+  "Tsunami",
+  "Volcanic Ash",
+  "Waterspout",
+  "Wildfire",
+  "Winter Storm",
+  "Winter Weather"))
+
+# sort from long to short
+event_type[,len:=nchar(typename)]
+sort_evtype<-event_type[order(event_type$len, decreasing=TRUE)]
+```
+
+According document, there are some strings able to trans & map to the valid event type. So, replace and regular them before find out the event type.
+```{r}
+trans_src_desc<-matrix(c("TSTM", "Thunderstorm",
+                      "Landslide", "Debris Flow",
+                      "STORM SURGE", "STORM SURGE/Tide",
+                      "ASTRONOMICAL HIGH TIDE", "High Surf",
+                      "Extreme Cold", "Frost/Freeze",
+                      "WILD/FOREST FIRE", "Wildfire",
+                      "URBAN/SML STREAM FLD", "Heavy Rain",
+                      "LIGHT SNOW", "Winter Storm",
+                      "DRY MICROBURST", "Thunderstorm Wind",
+                      "FREEZING RAIN", "Winter Weather",
+                      "GUSTY WINDS","Strong Wind",
+                      "SNOW SQUALL","Winter Weather",
+                      "EXTREME WINDCHILL","Extreme Cold/Wind Chill",
+                      "GUSTY WIND", "Strong Wind"), 
+                      ncol = 2, byrow=TRUE
+                    )
+# replace the string EVTYPE
+for (i in 1:nrow(trans_src_desc))
+  cost_data[,EVTYPE:=gsub(trans_src_desc[i,1],trans_src_desc[i,2],EVTYPE,ignore.case=TRUE)]
+```
+
+find out the valid event type as much as possible
+```{r,results='hide'}
+# get the valid event type by greping the event_type name from long to short
+cost_data[,valid_type:=""]
+for (et in sort_evtype$typename) {
+   cost_data[(valid_type=="") & grepl(et, cost_data$EVTYPE, ignore.case=TRUE), valid_type:=et]
+}
+```
+check whether there are the large number of records with invalid EVTYPE 
+```{r,results='hide'}
+# recheck the left event type
+ldata<-cost_data[valid_type=="", .N, by=EVTYPE]
+ldata[order(ldata$N, decreasing=TRUE)]
+```
+```{r}
+nrow(ldata)
+ldata[ldata$N>10,]
+```
+There are little invalid evtype records left.
+
+Check the event type appear in each year
+```{r}
+us<-unique(subset(cost_data,valid_type!="",select=c("year","valid_type")))
+us[,.N,by=year]
+```
+It seems before 1993, the number of event type in data is very small and there should be something wrong. So get the records after 1992 only
+```{r,results='hide'}
+cldata<-subset(cost_data, valid_type!="" & year>"1992")
+cldata$valid_type<-as.factor(cldata$valid_type)
+```
+
+### sum(FATALITIES+INJURIES) for each event type across US
+get the sum(FATALITIES+INJURIES) of each event type across US,sort event types according harmful from most to least
+
+```{r,results='hide'}
+cldata_popu<-subset(cldata, FATALITIES+INJURIES>0)
+cldata_popu[,harm_popu:=FATALITIES+INJURIES]
+popu_sum<-cldata_popu[,sum(harm_popu),by=valid_type]
+setnames(popu_sum, "V1", "sum")
+sorted_popu_sum<-popu_sum[order(popu_sum$sum, decreasing=TRUE)]
+```
+
+### sum(PROPDMG+CROPDMGEXP) for each event type across US
+get the sum(PROPDMG+CROPDMGEXP) for each event type across US
+```{r}
+cldata_cost<-subset(cldata, PROPDMG+CROPDMG>0)
+cldata_cost[,sum(PROPDMG),by=PROPDMGEXP]
+cldata_cost[,sum(CROPDMG),by=CROPDMGEXP]
+```
+filter out the record with invalid units, and then translate units, ready to add cost together, and then sum the cost for each event type
+
+```{r,results='hide'}
+cldata2<-subset(cldata_cost, PROPDMGEXP %in% c("K","k","M","m","B","b","")& CROPDMGEXP  %in% c("K","k","M","m","B","b",""))
+cldata2[PROPDMGEXP %in% c(""),pro_cost:=PROPDMG]
+cldata2[PROPDMGEXP %in% c("K","k"),pro_cost:=PROPDMG*10^3]
+cldata2[PROPDMGEXP %in% c("M","m"),pro_cost:=PROPDMG*10^6]
+cldata2[PROPDMGEXP %in% c("B","b"),pro_cost:=PROPDMG*10^9]
+
+cldata2[CROPDMGEXP %in% c(""),crop_cost:=CROPDMG]
+cldata2[CROPDMGEXP %in% c("K","k"),crop_cost:=CROPDMG*10^3]
+cldata2[CROPDMGEXP %in% c("M","m"),crop_cost:=CROPDMG*10^6]
+cldata2[CROPDMGEXP %in% c("B","b"),crop_cost:=CROPDMG*10^9]
+
+cldata2[, cost_sum:=pro_cost+crop_cost]
+# sum cost grou by valid event type
+cost_sum<-cldata2[,sum(cost_sum),by=valid_type]
+setnames(cost_sum, "V1", "sum")
+```
+sort the sum of event type from most to least
+```{r}
+sorted_cost_sum<-cost_sum[order(cost_sum$sum, decreasing=TRUE)]
+```
+
+## Results
+### Q1: most harmful events with respect to population health
+Across the United States, which types of events (as indicated in the EVTYPE variable) are most harmful with respect to population health?
+
+event tyep sorted according harm from most to lease:
+```{r}
+head(sorted_popu_sum)
+```
+
+most harmful event is:
+```{r}
+popu_sum[which(sum==max(popu_sum$sum))]
+```
+top 3 harmful event types are:
+```{r}
+topN_harm_popu<-sorted_popu_sum[1:3,]$valid_type
+head(topN_harm_popu)
+```
+
+### Q2. which types of events have the greatest economic consequences?
+Across the United States, which types of events have the greatest economic consequences?
+
+event tyep sorted according cost from most to lease:
+```{r}
+head(sorted_cost_sum)
+```
+the event type with most cost is:
+```{r}
+cost_sum[which(sum==max(cost_sum$sum))]
+```
+the top 3 event types cost most
+```{r}
+topN_cost<-sorted_cost_sum[1:3,]$valid_type
+head(topN_cost)
+```
+### Simple Pie Chart for harmfule and cost
+For public health and economic, there is different harmful event type.
+For public health, Tornado is most harmful. 
+For economic, Flood is most harmful.
+
+```{r}
+par(mfrow = c(1, 2),lty=1)
+pie(sorted_popu_sum$sum, labels=sorted_popu_sum$valid_type,col=rainbow(length(sorted_popu_sum$valid_type)), main="FATALITIES & INJURIES")
+pie(sorted_cost_sum$sum, labels=sorted_cost_sum$valid_type,col=rainbow(length(sorted_cost_sum$valid_type)), main="PROPDMG & CROPDMG")
+```
+
+### the Top3 event types influence to different state
+
+In different states, Top3 harmful event types are with different respect to population health
+```{r}
+pmelt<-melt(subset(cldata_popu, valid_type %in% topN_harm_popu), id.vars=c("valid_type", "STATE"),measure.vars=c("harm_popu"))
+popu_state_sum<-dcast(pmelt,STATE+valid_type~variable, fun=sum)
+data(state.names)
+smap<-map("state",plot = FALSE, fill = TRUE)
+df1<-merge(popu_state_sum, subset(state.names,!abb %in% c("HI","AK")),by.x="STATE",by.y="abb")
+
+mapplot(name~harm_popu|valid_type, data = df1,xlab="", layout=c(1,3),map = map("state",plot = FALSE, fill = TRUE), colramp = colorRampPalette(c("green", "blue")))
+```
+
+
+In defferent states, the damage cost for Top3 event types are different
+```{r}
+cmelt<-melt(subset(cldata2, valid_type %in% topN_cost), id.vars=c("valid_type", "STATE"),measure.vars=c("cost_sum"))
+cost_state_sum<-dcast(cmelt,STATE+valid_type~variable, fun=sum)
+
+df2<-merge(cost_state_sum, subset(state.names,!abb %in% c("HI","AK")),by.x="STATE",by.y="abb")
+mapplot(name~cost_sum|valid_type, data = df2,xlab="",layout = c(1, 3),map = map("state",plot = FALSE, fill = TRUE), colramp = colorRampPalette(c("green", "blue")))
+```
+
+
